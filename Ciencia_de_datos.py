@@ -18,9 +18,10 @@ import matplotlib.cm as cm
 import matplotlib.colors as colors
 import matplotlib.colors as mcolors
 from branca.colormap import linear
+import scipy.linalg as la
 
 # 1. Cargar datos
-df = pd.read_csv(r"C:\Users\Usuario\Downloads\practica para parcial\rentcrime.csv")
+df = pd.read_csv("rentcrime.csv")
 
 # 2. Vista general
 print("🔹 Shape:", df.shape)
@@ -166,20 +167,34 @@ print(model_gamma.summary())
 
 ################################ Llamamos al modelo GWR #############################################################
 
-#matplotlib.use('Agg')
-# coordenadas
-#coords = df_model[['longitude', 'latitude']].values
+print("\n>>> Iniciando modelo GWR...")
 
-# variables independientes
-#X_gwr = df_model[variables].values
+# Para evitar tiempos de ejecución de horas debido a la complejidad O(N^2) del GWR,
+# se toma una muestra de 1000 observaciones si el dataset es grande.
+if len(df_model) > 1500:
+    print(f"Dataset grande ({len(df_model)} filas). Tomando muestra aleatoria de 1000 filas para GWR...")
+    df_gwr = df_model.sample(n=1000, random_state=42).copy()
+else:
+    df_gwr = df_model.copy()
 
-# variable dependiente (usa log también)
-#y_gwr = np.log(df_model['price']).values.reshape((-1,1))
+# Coordenadas
+coords = df_gwr[['longitude', 'latitude']].values
 
-#bw = Sel_BW(coords, y_gwr, X_gwr).search()
+# Variables independientes
+X_gwr = df_gwr[variables].values
 
-#gwr_model = GWR(coords, y_gwr, X_gwr, bw).fit()
-#print(gwr_model.summary())
+# Variable dependiente (usamos log)
+y_gwr = np.log(df_gwr['price']).values.reshape((-1, 1))
+
+print("Buscando ancho de banda (bandwidth) óptimo para GWR...")
+# Buscar el ancho de banda óptimo
+bw_selector = Sel_BW(coords, y_gwr, X_gwr)
+bw = bw_selector.search(bw_min=2)
+print(f"Ancho de banda (bandwidth) óptimo encontrado: {bw}")
+
+print("Ajustando modelo GWR...")
+gwr_model = GWR(coords, y_gwr, X_gwr, bw).fit()
+print(gwr_model.summary())
 
 ############################################### Viendo el comportamiento de los modelos realizamos TEST DE HETEROCEDASTICIDAD##################################
 residuals = model_ols.resid
@@ -240,7 +255,7 @@ variables_geo = [
 X_geo = df_model[variables_geo].copy()
 y = np.log(df_model['price'])
 
-# 🔥 FORZAR A NUMÉRICO (CLAVE)
+#  FORZAR A NUMÉRICO (CLAVE)
 X_geo = X_geo.astype(float)
 
 ############################################
@@ -444,3 +459,192 @@ m2.save("mapa_precios.html")
 
 # abrir
 webbrowser.open("mapa_precios.html")
+
+# ==============================================================================
+# 🔹 ANÁLISIS GEOMÉTRICO Y ESTADÍSTICO DE DISTANCIAS ENTRE ZONAS
+# ==============================================================================
+
+print("\n>>> Iniciando análisis geométrico y probabilístico entre zonas...")
+
+# Asegurar que la columna 'zone' esté en df_model y sea la predicción del kmeans global
+df_model['zone'] = kmeans.predict(df_model[['latitude', 'longitude']])
+
+# Zonas a comparar
+selected_zones = [1, 4, 9, 10]
+
+# Variables seleccionadas para cada análisis (según diseño académico aprobado)
+vars_bhattacharyya = ['price', 'medIncome', 'square_feet', 'bathrooms']
+vars_riemann = ['price', 'medIncome', 'square_feet', 'bathrooms', 'bedrooms']
+vars_fisher_rao = ['price', 'medIncome', 'square_feet', 'bathrooms']
+
+# Funciones de distancia matemática
+def bhattacharyya_distance(mu1, Sigma1, mu2, Sigma2, reg=1e-6):
+    d = len(mu1)
+    # Regularización para evitar singularidades por baja varianza local o multicolinealidad
+    S1 = Sigma1 + reg * np.eye(d)
+    S2 = Sigma2 + reg * np.eye(d)
+    S = (S1 + S2) / 2.0
+    
+    sign_S, logdet_S = np.linalg.slogdet(S)
+    sign_S1, logdet_S1 = np.linalg.slogdet(S1)
+    sign_S2, logdet_S2 = np.linalg.slogdet(S2)
+    
+    db_cov = 0.5 * (logdet_S - 0.5 * (logdet_S1 + logdet_S2))
+    
+    diff = mu1 - mu2
+    try:
+        sol = np.linalg.solve(S, diff)
+        db_mean = 0.125 * np.dot(diff, sol)
+    except np.linalg.LinAlgError:
+        sol = np.linalg.pinv(S) @ diff
+        db_mean = 0.125 * np.dot(diff, sol)
+        
+    return db_mean + db_cov
+
+def riemann_covariance_distance(Sigma1, Sigma2, reg=1e-6):
+    d = Sigma1.shape[0]
+    S1 = Sigma1 + reg * np.eye(d)
+    S2 = Sigma2 + reg * np.eye(d)
+    
+    try:
+        # Resolver autovalores generalizados: S2 * v = lambda * S1 * v
+        lambdas = la.eigvals(S2, S1)
+        lambdas = np.real(lambdas)
+        lambdas = np.clip(lambdas, 1e-15, None)
+        return np.sqrt(np.sum(np.log(lambdas)**2))
+    except (la.LinAlgError, ValueError):
+        # Método alternativo usando descomposición espectral
+        S1_inv = la.pinv(S1)
+        S1_inv_sqrt = la.sqrtm(S1_inv)
+        M = S1_inv_sqrt @ S2 @ S1_inv_sqrt
+        lambdas = la.eigvalsh(M)
+        lambdas = np.real(lambdas)
+        lambdas = np.clip(lambdas, 1e-15, None)
+        return np.sqrt(np.sum(np.log(lambdas)**2))
+
+def fisher_rao_distance(mu1, Sigma1, mu2, Sigma2, reg=1e-6):
+    d = len(mu1)
+    # Embedding de Siegel / SPD de dimensión (d+1)x(d+1)
+    A = np.zeros((d+1, d+1))
+    A[:d, :d] = Sigma1 + np.outer(mu1, mu1)
+    A[:d, d] = mu1
+    A[d, :d] = mu1
+    A[d, d] = 1.0
+    
+    B = np.zeros((d+1, d+1))
+    B[:d, :d] = Sigma2 + np.outer(mu2, mu2)
+    B[:d, d] = mu2
+    B[d, :d] = mu2
+    B[d, d] = 1.0
+    
+    A += reg * np.eye(d+1)
+    B += reg * np.eye(d+1)
+    
+    try:
+        lambdas = la.eigvals(B, A)
+        lambdas = np.real(lambdas)
+        lambdas = np.clip(lambdas, 1e-15, None)
+        # Factor 1/sqrt(2) según la métrica inducida de Fisher-Rao
+        return (1.0 / np.sqrt(2.0)) * np.sqrt(np.sum(np.log(lambdas)**2))
+    except (la.LinAlgError, ValueError):
+        A_inv = la.pinv(A)
+        A_inv_sqrt = la.sqrtm(A_inv)
+        M = A_inv_sqrt @ B @ A_inv_sqrt
+        lambdas = la.eigvalsh(M)
+        lambdas = np.real(lambdas)
+        lambdas = np.clip(lambdas, 1e-15, None)
+        return (1.0 / np.sqrt(2.0)) * np.sqrt(np.sum(np.log(lambdas)**2))
+
+# Extraer parámetros estadísticos por zona
+stats = {}
+for z in selected_zones:
+    df_z = df_model[df_model['zone'] == z]
+    stats[z] = {
+        'count': len(df_z),
+        'mu_bhat': df_z[vars_bhattacharyya].mean().values,
+        'Sigma_bhat': df_z[vars_bhattacharyya].cov().values,
+        'Sigma_riemann': df_z[vars_riemann].cov().values,
+        'mu_fr': df_z[vars_fisher_rao].mean().values,
+        'Sigma_fr': df_z[vars_fisher_rao].cov().values
+    }
+    print(f"-> Zona {z}: {len(df_z)} observaciones.")
+
+# Matrices de distancias
+n_zones = len(selected_zones)
+dist_bhat = np.zeros((n_zones, n_zones))
+dist_riemann = np.zeros((n_zones, n_zones))
+dist_fr = np.zeros((n_zones, n_zones))
+
+for i in range(n_zones):
+    for j in range(n_zones):
+        if i == j:
+            dist_bhat[i, j] = 0.0
+            dist_riemann[i, j] = 0.0
+            dist_fr[i, j] = 0.0
+        elif i < j:
+            z1, z2 = selected_zones[i], selected_zones[j]
+            # Bhattacharyya
+            db = bhattacharyya_distance(stats[z1]['mu_bhat'], stats[z1]['Sigma_bhat'],
+                                         stats[z2]['mu_bhat'], stats[z2]['Sigma_bhat'])
+            dist_bhat[i, j] = db
+            dist_bhat[j, i] = db
+            
+            # Riemann
+            dr = riemann_covariance_distance(stats[z1]['Sigma_riemann'], stats[z2]['Sigma_riemann'])
+            dist_riemann[i, j] = dr
+            dist_riemann[j, i] = dr
+            
+            # Fisher-Rao (Calvo-Oller)
+            dfr = fisher_rao_distance(stats[z1]['mu_fr'], stats[z1]['Sigma_fr'],
+                                       stats[z2]['mu_fr'], stats[z2]['Sigma_fr'])
+            dist_fr[i, j] = dfr
+            dist_fr[j, i] = dfr
+
+# Presentación en DataFrames con nombres claros
+labels = [f"Zone_{z}" for z in selected_zones]
+df_dist_bhat = pd.DataFrame(dist_bhat, index=labels, columns=labels)
+df_dist_riemann = pd.DataFrame(dist_riemann, index=labels, columns=labels)
+df_dist_fr = pd.DataFrame(dist_fr, index=labels, columns=labels)
+
+print("\n==============================================================")
+print("📊 MATRIZ DE DISTANCIA DE BHATTACHARYYA (Price, medIncome, square_feet, bathrooms)")
+print("==============================================================")
+print(df_dist_bhat.round(4))
+
+print("\n==============================================================")
+print("📊 MATRIZ DE DISTANCIA DE RIEMANN (Covarianzas: Price, medIncome, square_feet, bathrooms, bedrooms)")
+print("==============================================================")
+print(df_dist_riemann.round(4))
+
+print("\n==============================================================")
+print("📊 MATRIZ DE DISTANCIA DE FISHER-RAO (Price, medIncome, square_feet, bathrooms)")
+print("==============================================================")
+print(df_dist_fr.round(4))
+
+# Generar gráficos y guardarlos en una imagen
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+# Bhattacharyya Heatmap
+sns.heatmap(df_dist_bhat, annot=True, cmap="Oranges", fmt=".4f", ax=axes[0], 
+            cbar_kws={'label': 'Distancia Bhattacharyya'})
+axes[0].set_title("Distancia de Bhattacharyya\n(Similitud Probabilística)")
+axes[0].set_aspect('equal')
+
+# Riemann Heatmap
+sns.heatmap(df_dist_riemann, annot=True, cmap="Blues", fmt=".4f", ax=axes[1], 
+            cbar_kws={'label': 'Distancia Riemann'})
+axes[1].set_title("Distancia de Riemann\n(Estructuras de Covarianza)")
+axes[1].set_aspect('equal')
+
+# Fisher-Rao Heatmap
+sns.heatmap(df_dist_fr, annot=True, cmap="Greens", fmt=".4f", ax=axes[2], 
+            cbar_kws={'label': 'Distancia Fisher-Rao'})
+axes[2].set_title("Distancia de Fisher-Rao (Calvo-Oller)\n(Distribuciones Multivariadas)")
+axes[2].set_aspect('equal')
+
+plt.suptitle("Comparación Geométrica e Información Estadística entre Zonas", fontsize=14, weight='bold')
+plt.tight_layout()
+plt.savefig("comparativa_distancias_zonas.png", dpi=300)
+plt.show()
+
+print("\n>>> Gráfico comparativo guardado como 'comparativa_distancias_zonas.png'")
